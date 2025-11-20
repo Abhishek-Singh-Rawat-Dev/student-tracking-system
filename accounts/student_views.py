@@ -230,14 +230,106 @@ def ai_chat(request):
                 message=message
             )
             
-            # Generate AI response
+            # Gather comprehensive student data from database
+            from timetable.models import Enrollment, Attendance, TimetableEntry
+            from django.utils import timezone
+            from datetime import timedelta
+            
+            # Get enrolled subjects
+            enrollments = Enrollment.objects.filter(
+                student=student,
+                is_active=True
+            ).select_related('subject').order_by('subject__name')
+            
+            enrolled_subjects = []
+            for enrollment in enrollments:
+                enrolled_subjects.append({
+                    'name': enrollment.subject.name,
+                    'code': enrollment.subject.code,
+                    'credits': enrollment.subject.credits or 'N/A'
+                })
+            
+            # Get attendance statistics
+            total_attendance = Attendance.objects.filter(student=student).count()
+            present_count = Attendance.objects.filter(student=student, status='present').count()
+            absent_count = Attendance.objects.filter(student=student, status='absent').count()
+            late_count = Attendance.objects.filter(student=student, status='late').count()
+            attendance_percentage = (present_count / total_attendance * 100) if total_attendance > 0 else 0
+            
+            # Get subject-wise attendance
+            subject_attendance = {}
+            for enrollment in enrollments:
+                subject_total = Attendance.objects.filter(
+                    student=student,
+                    timetable_entry__subject=enrollment.subject
+                ).count()
+                subject_present = Attendance.objects.filter(
+                    student=student,
+                    timetable_entry__subject=enrollment.subject,
+                    status='present'
+                ).count()
+                subject_percentage = (subject_present / subject_total * 100) if subject_total > 0 else 0
+                
+                subject_attendance[enrollment.subject.name] = {
+                    'total': subject_total,
+                    'present': subject_present,
+                    'percentage': round(subject_percentage, 1)
+                }
+            
+            # Get today's timetable
+            today = timezone.now().date()
+            day_of_week = today.weekday()  # 0 = Monday, 6 = Sunday
+            today_timetable = TimetableEntry.objects.filter(
+                subject__in=[e.subject for e in enrollments],
+                course=student.course,
+                year=student.year,
+                section=student.section,
+                day_of_week=day_of_week,
+                is_active=True
+            ).select_related('subject', 'teacher', 'room', 'time_slot').order_by('time_slot__start_time')
+            
+            today_classes = []
+            for entry in today_timetable:
+                today_classes.append({
+                    'subject': entry.subject.name,
+                    'teacher': entry.teacher.full_name if entry.teacher else 'TBA',
+                    'room': entry.room.room_number if entry.room else 'TBA',
+                    'time': f"{entry.time_slot.start_time.strftime('%I:%M %p')} - {entry.time_slot.end_time.strftime('%I:%M %p')}"
+                })
+            
+            # Get recent attendance records (last 10)
+            recent_attendance = Attendance.objects.filter(
+                student=student
+            ).select_related('timetable_entry__subject', 'timetable_entry__teacher').order_by('-date')[:10]
+            
+            recent_attendance_list = []
+            for record in recent_attendance:
+                recent_attendance_list.append({
+                    'date': record.date.strftime('%Y-%m-%d'),
+                    'subject': record.timetable_entry.subject.name,
+                    'status': record.status
+                })
+            
+            # Build comprehensive context
             context = {
                 'student_info': {
                     'name': student.user.get_full_name(),
+                    'roll_number': student.roll_number,
                     'course': student.course,
                     'year': student.year,
                     'section': student.section
-                }
+                },
+                'enrolled_subjects': enrolled_subjects,
+                'attendance_summary': {
+                    'total_classes': total_attendance,
+                    'present': present_count,
+                    'absent': absent_count,
+                    'late': late_count,
+                    'overall_percentage': round(attendance_percentage, 1)
+                },
+                'subject_attendance': subject_attendance,
+                'today_timetable': today_classes,
+                'recent_attendance': recent_attendance_list
             }
             
             ai_response = ai_service.chat_response(message, context)

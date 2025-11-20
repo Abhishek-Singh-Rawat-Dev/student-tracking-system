@@ -36,6 +36,31 @@ class StudentAIChat {
         }
     }
 
+    // Get CSRF token from various sources
+    getCSRFToken() {
+        // Try to get from hidden input
+        const csrfInput = document.querySelector('[name=csrfmiddlewaretoken]');
+        if (csrfInput) {
+            return csrfInput.value;
+        }
+        
+        // Try to get from cookies (Django default)
+        const name = 'csrftoken';
+        let cookieValue = null;
+        if (document.cookie && document.cookie !== '') {
+            const cookies = document.cookie.split(';');
+            for (let i = 0; i < cookies.length; i++) {
+                const cookie = cookies[i].trim();
+                if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                    cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                    break;
+                }
+            }
+        }
+        
+        return cookieValue;
+    }
+
     // Send message to AI chat
     sendMessage() {
         const messageInput = document.getElementById('messageInput');
@@ -52,12 +77,21 @@ class StudentAIChat {
         // Show typing indicator
         this.showTypingIndicator();
         
+        // Get CSRF token
+        const csrfToken = this.getCSRFToken();
+        if (!csrfToken) {
+            console.error('CSRF token not found');
+            this.hideTypingIndicator();
+            this.addMessage('Error: Security token not found. Please refresh the page.', 'ai');
+            return;
+        }
+
         // Send to backend
         fetch(window.location.pathname, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value
+                'X-CSRFToken': csrfToken
             },
             body: JSON.stringify({
                 message: message,
