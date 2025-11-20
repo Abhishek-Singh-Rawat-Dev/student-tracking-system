@@ -443,13 +443,30 @@ def manage_timetable(request):
         
         elif action == 'generate_algorithmic_timetable':
             try:
-                if not TimetableGenerator:
-                    messages.error(request, 'Algorithmic timetable generator not available.')
-                    return redirect('accounts:manage_timetable')
-                
                 # Get configuration
                 config_name = request.POST.get('config_name', 'default')
-                algorithm_type = request.POST.get('algorithm_type', 'constraint_satisfaction')
+                # Always use Gemini AI for timetable generation
+                algorithm_type = 'gemini_ai'
+                
+                # Get form data - course, year, section from form submission
+                course_name = request.POST.get('course', '').strip()
+                year_str = request.POST.get('year', '').strip()
+                section = request.POST.get('section', '').strip().upper()
+                
+                # Validate form inputs
+                if not course_name:
+                    messages.error(request, 'Please select a course.')
+                    return redirect('accounts:manage_timetable')
+                
+                if not year_str or not year_str.isdigit():
+                    messages.error(request, 'Please select a valid year.')
+                    return redirect('accounts:manage_timetable')
+                
+                if not section:
+                    messages.error(request, 'Please enter a section.')
+                    return redirect('accounts:manage_timetable')
+                
+                year = int(year_str)
                 
                 # Get or create configuration
                 config, created = TimetableConfiguration.objects.get_or_create(
@@ -468,178 +485,216 @@ def manage_timetable(request):
                     }
                 )
                 
-                # Get all active course/year/section combinations
-                all_combinations = TimetableEntry.objects.filter(
-                    is_active=True
-                ).values('course', 'year', 'section').distinct()
+                print(f"DEBUG: Generating AI-powered timetable with Gemini for {course_name} Year {year} Section {section}")
                 
-                if not all_combinations.exists():
-                    messages.error(request, 'No existing timetable entries found. Please add some entries first.')
+                # Get the Course object from the course name
+                try:
+                    course_obj = Course.objects.get(name=course_name, is_active=True)
+                except Course.DoesNotExist:
+                    messages.error(request, f'Course "{course_name}" not found or is inactive.')
                     return redirect('accounts:manage_timetable')
                 
-                generated_count = 0
-                total_combinations = len(all_combinations)
+                # Get existing entries count for this specific course/year/section
+                existing_entries_count = TimetableEntry.objects.filter(
+                    course=course_name, year=year, section=section, is_active=True
+                ).count()
                 
-                for combo in all_combinations:
-                    course_name = combo['course']
-                    year = combo['year']
-                    section = combo['section']
+                # Get subjects and teachers for this course/year
+                subjects = Subject.objects.filter(
+                    course=course_obj, year=year, is_active=True
+                ).select_related('course')
+                
+                teacher_subjects = TeacherSubject.objects.filter(
+                    subject__course=course_obj,
+                    subject__year=year,
+                    is_active=True
+                ).select_related('subject', 'teacher')
+                
+                if not subjects.exists():
+                    messages.error(request, f'No subjects found for {course_name} Year {year}. Please add subjects first.')
+                    return redirect('accounts:manage_timetable')
+                
+                if not teacher_subjects.exists():
+                    messages.error(request, f'No teachers assigned to subjects for {course_name} Year {year}. Please assign teachers to subjects first.')
+                    return redirect('accounts:manage_timetable')
+                
+                # Build subject requirements for Gemini AI
+                subject_requirements = []
+                for ts in teacher_subjects:
+                    subject = ts.subject
+                    requirement = {
+                        'subject_id': subject.id,
+                        'subject_code': subject.code,
+                        'subject_name': subject.name,
+                        'credits': subject.credits,
+                        'periods_per_week': subject.credits * 2,  # 2 periods per credit (standard: 1 credit = 2 periods/week)
+                        'teacher_id': ts.teacher.id,
+                        'teacher_name': ts.teacher.name
+                    }
+                    subject_requirements.append(requirement)
+                
+                # Limit subjects to prevent memory issues (max 10 subjects per course)
+                if len(subject_requirements) > 10:
+                    print(f"DEBUG: Too many subjects ({len(subject_requirements)}) for {course_name} Year {year}, limiting to 10")
+                    subject_requirements = subject_requirements[:10]
+                
+                # Skip if too few subjects (less than 1)
+                if len(subject_requirements) < 1:
+                    messages.error(request, f'At least one subject with assigned teacher is required for {course_name} Year {year}.')
+                    return redirect('accounts:manage_timetable')
+                
+                # Gather all database data for Gemini
+                # Note: Room and TimeSlot are already imported at module level
+                
+                # Get all rooms
+                all_rooms = Room.objects.filter(is_active=True)
+                rooms_data = [{
+                    'room_number': room.room_number,
+                    'room_name': room.room_name,
+                    'room_type': room.room_type,
+                    'capacity': room.capacity,
+                    'floor': room.floor,
+                    'building': room.building
+                } for room in all_rooms]
+                
+                if not rooms_data:
+                    messages.error(request, 'No active rooms found. Please add rooms first.')
+                    return redirect('accounts:manage_timetable')
+                
+                # Get all time slots
+                all_time_slots = TimeSlot.objects.filter(is_active=True).order_by('period_number')
+                time_slots_data = [{
+                    'period_number': slot.period_number,
+                    'start_time': str(slot.start_time),
+                    'end_time': str(slot.end_time),
+                    'is_break': slot.is_break,
+                    'break_duration': slot.break_duration
+                } for slot in all_time_slots]
+                
+                if not time_slots_data:
+                    messages.error(request, 'No active time slots found. Please add time slots first.')
+                    return redirect('accounts:manage_timetable')
+                
+                # Get all teachers with their assigned subjects
+                all_teachers = Teacher.objects.filter(is_active=True)
+                teachers_data = []
+                for teacher in all_teachers:
+                    assigned_subjects = TeacherSubject.objects.filter(
+                        teacher=teacher, is_active=True
+                    ).values_list('subject__code', flat=True)
+                    teachers_data.append({
+                        'id': teacher.id,
+                        'name': teacher.name,
+                        'employee_id': teacher.employee_id,
+                        'department': teacher.department,
+                        'assigned_subjects': list(assigned_subjects)
+                    })
+                
+                # Get existing timetable entries for conflict avoidance (for this specific course/year/section)
+                existing_entries_list = TimetableEntry.objects.filter(
+                    course=course_name, year=year, section=section, is_active=True
+                ).select_related('subject', 'teacher', 'room', 'time_slot')[:50]
+                existing_entries_data = [{
+                    'day': entry.day_of_week,
+                    'period': entry.time_slot.period_number if entry.time_slot else 0,
+                    'subject': entry.subject.code if entry.subject else 'N/A',
+                    'teacher': entry.teacher.name if entry.teacher else 'N/A',
+                    'room': entry.room.room_number if entry.room else 'N/A'
+                } for entry in existing_entries_list]
+                
+                # Build comprehensive context for Gemini
+                timetable_context = {
+                    'config': {
+                        'days_per_week': config.days_per_week,
+                        'periods_per_day': config.periods_per_day,
+                        'break_periods': config.break_periods,
+                        'max_teacher_periods_per_day': config.max_teacher_periods_per_day,
+                        'max_consecutive_periods': config.max_consecutive_periods,
+                        'max_subject_periods_per_day': config.max_subject_periods_per_day
+                    },
+                    'course_info': {
+                        'course': course_name,
+                        'year': year,
+                        'section': section
+                    },
+                    'subjects': subject_requirements,
+                    'teachers': teachers_data,
+                    'rooms': rooms_data,
+                    'time_slots': time_slots_data,
+                    'existing_entries': existing_entries_data
+                }
+                
+                # Generate timetable using Gemini AI
+                result = None
+                try:
+                    print(f"DEBUG: Calling Gemini AI with {len(subject_requirements)} subjects, {len(rooms_data)} rooms, {len(time_slots_data)} time slots")
+                    result = ai_service.generate_timetable_with_gemini(timetable_context)
+                    print(f"DEBUG: Gemini returned result: success={result.get('success')}, algorithm={result.get('algorithm')}")
+                except Exception as gemini_error:
+                    print(f"DEBUG: Gemini error for {course_name} Year {year} Section {section}: {gemini_error}")
+                    import traceback
+                    traceback.print_exc()
+                    messages.error(request, f'Failed to generate timetable with Gemini AI: {str(gemini_error)}')
+                    return redirect('accounts:manage_timetable')
+                
+                # Check if result was generated successfully
+                if not result or not result.get('success'):
+                    error_msg = result.get('error', 'Unknown error') if result else 'No response from Gemini'
+                    print(f"DEBUG: Gemini failed for {course_name} Year {year} Section {section}: {error_msg}")
+                    messages.error(request, f'Failed to generate timetable: {error_msg}')
+                    return redirect('accounts:manage_timetable')
+                
+                # Validate constraints (simplified validation)
+                violations = []
+                if result.get('constraint_violations'):
+                    violations = result.get('constraint_violations', [])
+                
+                # Create AI-generated timetable suggestion
+                try:
+                    # Get current academic year and semester dynamically
+                    academic_year = _get_current_academic_year()
+                    semester = _get_current_semester()
                     
-                    print(f"DEBUG: Generating algorithmic timetable for {course_name} Year {year} Section {section}")
-                    
-                    # Get the Course object from the course name
-                    try:
-                        course_obj = Course.objects.get(name=course_name, is_active=True)
-                    except Course.DoesNotExist:
-                        print(f"DEBUG: Course '{course_name}' not found, skipping...")
-                        continue
-                    
-                    # Get existing entries to resolve conflicts
-                    existing_entries = TimetableEntry.objects.filter(
-                        course=course_name, year=year, section=section, is_active=True
-                    ).count()
-                    
-                    # Get subjects and teachers for this course/year
-                    subjects = Subject.objects.filter(
-                        course=course_obj, year=year, is_active=True
-                    ).select_related('course')
-                    
-                    teacher_subjects = TeacherSubject.objects.filter(
-                        subject__course=course_obj,
-                        subject__year=year,
-                        is_active=True
-                    ).select_related('subject', 'teacher')
-                    
-                    if not subjects.exists():
-                        print(f"DEBUG: No subjects found for {course_name} Year {year}, skipping...")
-                        continue
-                    
-                    if not teacher_subjects.exists():
-                        print(f"DEBUG: No teachers assigned to subjects for {course_name} Year {year}, skipping...")
-                        continue
-                    
-                    # Build subject requirements for algorithmic solver
-                    subject_requirements = []
-                    for ts in teacher_subjects:
-                        subject = ts.subject
-                        requirement = {
-                            'subject_id': subject.id,
-                            'subject_code': subject.code,
-                            'subject_name': subject.name,
-                            'credits': subject.credits,
-                            'periods_per_week': subject.credits * 2,  # 2 periods per credit (standard: 1 credit = 2 periods/week)
-                            'teacher_id': ts.teacher.id,
-                            'teacher_name': ts.teacher.name
-                        }
-                        subject_requirements.append(requirement)
-                    
-                    # Limit subjects to prevent memory issues (max 8 subjects per course)
-                    if len(subject_requirements) > 8:
-                        print(f"DEBUG: Too many subjects ({len(subject_requirements)}) for {course_name} Year {year}, limiting to 8 to prevent memory issues")
-                        subject_requirements = subject_requirements[:8]
-                    
-                    # Skip if too few subjects (less than 2)
-                    if len(subject_requirements) < 2:
-                        print(f"DEBUG: Too few subjects ({len(subject_requirements)}) for {course_name} Year {year}, skipping...")
-                        continue
-                    
-                    # Create algorithmic timetable generator
-                    generator = TimetableGenerator(algorithm_type=algorithm_type)
-                    
-                    # Generate timetable using algorithm with timeout protection
-                    result = None
-                    try:
-                        import threading
-                        import time
-                        
-                        # Cross-platform timeout solution
-                        timeout_occurred = False
-                        
-                        def timeout_handler():
-                            nonlocal timeout_occurred
-                            timeout_occurred = True
-                        
-                        # Set timeout to 10 seconds to prevent memory issues
-                        timer = threading.Timer(10.0, timeout_handler)
-                        timer.start()
-                        
-                        start_time = time.time()
-                        result = generator.generate_timetable(
-                            subjects=create_subject_requirements(subject_requirements),
-                            days=config.days_per_week,
-                            periods=config.periods_per_day,
-                            break_periods=config.break_periods
-                        )
-                        
-                        timer.cancel()  # Cancel the timer
-                        
-                        # Check if timeout occurred
-                        if timeout_occurred:
-                            raise TimeoutError("Algorithm execution timed out")
-                            
-                    except TimeoutError:
-                        print(f"DEBUG: Algorithm timed out for {course_name} Year {year} Section {section}, skipping...")
-                        continue
-                    except Exception as algo_error:
-                        print(f"DEBUG: Algorithm error for {course_name} Year {year} Section {section}: {algo_error}")
-                        continue
-                    
-                    # Check if result was generated successfully
-                    if not result or not result.get('success'):
-                        print(f"DEBUG: Algorithm failed or timed out for {course_name} Year {year} Section {section}")
-                        continue
-                    
-                    # Validate constraints
-                    violations = validate_timetable_constraints(result['grid'], result['subjects'])
-                    
-                    # Create algorithmic timetable suggestion
-                    try:
-                        # Get current academic year and semester dynamically
-                        academic_year = _get_current_academic_year()
-                        semester = _get_current_semester()
-                        
-                        suggestion = AlgorithmicTimetableSuggestion.objects.create(
-                            generated_by=request.user,
-                            course=course_name,
-                            year=year,
-                            section=section,
-                            academic_year=academic_year,
-                            semester=semester,
-                            algorithm_type=algorithm_type,
-                            max_periods_per_day=config.periods_per_day,
-                            max_teacher_periods_per_day=config.max_teacher_periods_per_day,
-                            max_consecutive_periods=config.max_consecutive_periods,
-                            break_duration=config.break_duration,
-                            suggestion_data={
-                                'algorithm': algorithm_type,
-                                'config': {
-                                    'days_per_week': config.days_per_week,
-                                    'periods_per_day': config.periods_per_day,
-                                    'period_duration': config.period_duration,
-                                    'break_periods': config.break_periods,
-                                    'break_duration': config.break_duration
-                                },
-                                'generated_at': timezone.now().isoformat(),
-                                'grid': result['grid'],
-                                'subjects': result['subjects'],
-                                'execution_time': result['execution_time'],
-                                'constraint_violations': violations
+                    suggestion = AlgorithmicTimetableSuggestion.objects.create(
+                        generated_by=request.user,
+                        course=course_name,
+                        year=year,
+                        section=section,
+                        academic_year=academic_year,
+                        semester=semester,
+                        algorithm_type='gemini_ai',
+                        max_periods_per_day=config.periods_per_day,
+                        max_teacher_periods_per_day=config.max_teacher_periods_per_day,
+                        max_consecutive_periods=config.max_consecutive_periods,
+                        break_duration=config.break_duration,
+                        suggestion_data={
+                            'algorithm': 'gemini_ai',
+                            'config': {
+                                'days_per_week': config.days_per_week,
+                                'periods_per_day': config.periods_per_day,
+                                'period_duration': config.period_duration,
+                                'break_periods': config.break_periods,
+                                'break_duration': config.break_duration
                             },
-                            optimization_score=result['optimization_score'],
-                            conflicts_resolved=existing_entries,
-                            constraint_violations=len(violations),
-                            status='generated'
-                        )
-                        print(f"DEBUG: Created algorithmic suggestion with ID: {suggestion.id} for {course_name} Year {year} Section {section}")
-                        generated_count += 1
-                    except Exception as create_error:
-                        print(f"DEBUG: Error creating AlgorithmicTimetableSuggestion for {course_name} Year {year} Section {section}: {create_error}")
-                        continue
-                
-                if generated_count > 0:
-                    messages.success(request, f'Generated {generated_count} algorithmic timetable suggestions for {total_combinations} course/year/section combinations using {algorithm_type} algorithm.')
-                else:
-                    messages.warning(request, 'No algorithmic timetable suggestions could be generated. Check if subjects and teachers are properly assigned.')
+                            'generated_at': timezone.now().isoformat(),
+                            'grid': result['grid'],
+                            'subjects': result['subjects'],
+                            'execution_time': result.get('execution_time', 0.5),
+                            'constraint_violations': violations
+                        },
+                        optimization_score=result.get('optimization_score', 80),
+                        conflicts_resolved=existing_entries_count,
+                        constraint_violations=len(violations),
+                        status='generated'
+                    )
+                    print(f"DEBUG: Created Gemini AI suggestion with ID: {suggestion.id} for {course_name} Year {year} Section {section}")
+                    messages.success(request, f'Successfully generated AI-powered timetable for {course_name} Year {year} Section {section} using Gemini AI!')
+                except Exception as create_error:
+                    print(f"DEBUG: Error creating AlgorithmicTimetableSuggestion for {course_name} Year {year} Section {section}: {create_error}")
+                    import traceback
+                    traceback.print_exc()
+                    messages.error(request, f'Failed to save timetable suggestion: {str(create_error)}')
+                    return redirect('accounts:manage_timetable')
             except Exception as e:
                 print(f"DEBUG: Error in generate_algorithmic_timetable: {e}")
                 messages.error(request, f'Failed to generate algorithmic timetable suggestions: {str(e)}')

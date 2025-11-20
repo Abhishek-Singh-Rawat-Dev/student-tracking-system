@@ -55,6 +55,7 @@ class AlgorithmicTimetableSuggestion(models.Model):
     ]
     
     ALGORITHM_CHOICES = [
+        ('gemini_ai', 'Gemini AI'),
         ('constraint_satisfaction', 'Constraint Satisfaction'),
         ('genetic_algorithm', 'Genetic Algorithm'),
         ('greedy_algorithm', 'Greedy Algorithm'),

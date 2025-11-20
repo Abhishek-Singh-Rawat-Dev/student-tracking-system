@@ -1,6 +1,6 @@
 """
 AI Service integration for Student Tracking System.
-Handles OpenAI API calls for chat, recommendations, and analytics.
+Handles Google Gemini API calls for chat, recommendations, and analytics.
 """
 
 from django.conf import settings
@@ -11,26 +11,22 @@ import json
 from datetime import datetime, timedelta
 
 try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    GEMINI_AVAILABLE = True
 except ImportError:
-    OPENAI_AVAILABLE = False
-
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
+    GEMINI_AVAILABLE = False
+    HarmCategory = None
+    HarmBlockThreshold = None
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 class AIService:
-    """AI service wrapper for OpenAI integration."""
+    """AI service wrapper for Google Gemini integration."""
     
     def __init__(self):
-        self.client = None
-        self.hf_token = None
+        self.model = None
         self.mock_mode = True
         self.ai_provider = 'offline'
         
@@ -43,61 +39,36 @@ class AIService:
             self.offline_ai_available = False
             logger.warning(f"Offline AI not available: {e}")
         
-        # Try Groq first (free tier, OpenAI-compatible API)
-        groq_api_key = os.environ.get('GROQ_API_KEY') or getattr(settings, 'GROQ_API_KEY', None)
-        groq_base_url = os.environ.get('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
-        if OPENAI_AVAILABLE and groq_api_key:
-            try:
-                # Use only broadly supported args to maximize compatibility across client versions
-                self.client = OpenAI(api_key=groq_api_key, base_url=groq_base_url)
-                self.mock_mode = False
-                self.ai_provider = 'groq'
-                logger.info("Groq (OpenAI-compatible) client initialized successfully")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Groq client: {str(e)}")
-                self.client = None
-
-        # Try OpenAI (paid) if Groq not configured
-        if (OPENAI_AVAILABLE and 
-            not self.client and
-            hasattr(settings, 'OPENAI_API_KEY') and 
-            settings.OPENAI_API_KEY and 
-            settings.OPENAI_API_KEY != '' and
-            settings.OPENAI_API_KEY != 'sk-your-openai-api-key-here'):
-            try:
-                # Use only broadly supported args
-                self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-                self.mock_mode = False
-                self.ai_provider = 'openai'
-                logger.info("OpenAI client initialized successfully")
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenAI client: {str(e)}")
-                self.client = None
+        # Initialize Gemini
+        gemini_api_key = os.environ.get('GEMINI_API_KEY') or getattr(settings, 'GEMINI_API_KEY', None)
+        gemini_model_name = os.environ.get('GEMINI_MODEL') or getattr(settings, 'GEMINI_MODEL', 'gemini-pro')
         
-        # Try Hugging Face as fallback
-        if (not self.client and REQUESTS_AVAILABLE and
-            hasattr(settings, 'HUGGINGFACE_API_KEY') and 
-            settings.HUGGINGFACE_API_KEY and 
-            settings.HUGGINGFACE_API_KEY != '' and
-            settings.HUGGINGFACE_API_KEY.startswith('hf_')):
+        if GEMINI_AVAILABLE and gemini_api_key and gemini_api_key != '':
             try:
-                self.hf_token = settings.HUGGINGFACE_API_KEY
-                # Test the token
-                headers = {"Authorization": f"Bearer {self.hf_token}"}
-                test_response = requests.get("https://huggingface.co/api/whoami", headers=headers, timeout=10)
-                if test_response.status_code == 200:
-                    self.mock_mode = False
-                    self.ai_provider = 'huggingface'
-                    logger.info("Hugging Face API initialized successfully")
+                genai.configure(api_key=gemini_api_key)
+                # Configure safety settings to allow educational content
+                if HarmCategory and HarmBlockThreshold:
+                    safety_settings = {
+                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                    }
+                    self.model = genai.GenerativeModel(
+                        gemini_model_name,
+                        safety_settings=safety_settings
+                    )
                 else:
-                    logger.warning("Hugging Face token validation failed")
-                    self.hf_token = None
+                    self.model = genai.GenerativeModel(gemini_model_name)
+                self.mock_mode = False
+                self.ai_provider = 'gemini'
+                logger.info(f"Gemini client initialized successfully with model: {gemini_model_name}")
             except Exception as e:
-                logger.warning(f"Failed to initialize Hugging Face API: {str(e)}")
-                self.hf_token = None
+                logger.warning(f"Failed to initialize Gemini client: {str(e)}")
+                self.model = None
         
         # Final mode determination
-        if not self.client and not self.hf_token:
+        if not self.model:
             if self.offline_ai_available:
                 self.ai_provider = 'offline'
                 self.mock_mode = False
@@ -110,12 +81,8 @@ class AIService:
     def chat_with_ai(self, message: str, context: Dict = None) -> str:
         """Chat with AI for student queries."""
         try:
-            if self.ai_provider == 'groq' and not self.mock_mode:
-                return self._chat_with_groq(message, context)
-            elif self.ai_provider == 'openai' and not self.mock_mode:
-                return self._chat_with_openai(message, context)
-            elif self.ai_provider == 'huggingface' and not self.mock_mode:
-                return self._chat_with_huggingface(message, context)
+            if self.ai_provider == 'gemini' and not self.mock_mode:
+                return self._chat_with_gemini(message, context)
             elif self.ai_provider == 'offline' and self.offline_ai_available:
                 return self._chat_with_offline_ai(message, context)
             else:
@@ -141,23 +108,22 @@ class AIService:
             if self.mock_mode:
                 return self._mock_study_recommendations(student_data)
             
-            if not hasattr(settings, 'OPENAI_API_KEY') or not settings.OPENAI_API_KEY:
+            if not hasattr(settings, 'GEMINI_API_KEY') or not settings.GEMINI_API_KEY:
                 return self._mock_study_recommendations(student_data)
             
             prompt = self._build_recommendation_prompt(student_data)
+            full_prompt = f"You are an AI study advisor for students. Provide personalized study recommendations based on their academic data.\n\n{prompt}"
             
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are an AI study advisor for students. Provide personalized study recommendations based on their academic data."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=800,
-                temperature=0.6
+            response = self.model.generate_content(
+                full_prompt,
+                generation_config={
+                    'max_output_tokens': 800,
+                    'temperature': 0.6,
+                }
             )
             
             # Parse the response to structured format
-            content = response.choices[0].message.content.strip()
+            content = response.text.strip()
             return self._parse_recommendation_response(content)
             
         except Exception as e:
@@ -170,22 +136,21 @@ class AIService:
             if self.mock_mode:
                 return self._mock_timetable_optimization(timetable_data)
             
-            if not hasattr(settings, 'OPENAI_API_KEY') or not settings.OPENAI_API_KEY:
+            if not hasattr(settings, 'GEMINI_API_KEY') or not settings.GEMINI_API_KEY:
                 return self._mock_timetable_optimization(timetable_data)
             
             prompt = self._build_optimization_prompt(timetable_data)
+            full_prompt = f"You are a timetable optimization expert. Analyze schedules and suggest improvements for better learning outcomes.\n\n{prompt}"
             
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a timetable optimization expert. Analyze schedules and suggest improvements for better learning outcomes."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=600,
-                temperature=0.5
+            response = self.model.generate_content(
+                full_prompt,
+                generation_config={
+                    'max_output_tokens': 600,
+                    'temperature': 0.5,
+                }
             )
             
-            content = response.choices[0].message.content.strip()
+            content = response.text.strip()
             return self._parse_optimization_response(content)
             
         except Exception as e:
@@ -198,22 +163,21 @@ class AIService:
             if self.mock_mode:
                 return self._mock_performance_analysis(performance_data)
             
-            if not hasattr(settings, 'OPENAI_API_KEY') or not settings.OPENAI_API_KEY:
+            if not hasattr(settings, 'GEMINI_API_KEY') or not settings.GEMINI_API_KEY:
                 return self._mock_performance_analysis(performance_data)
             
             prompt = self._build_analysis_prompt(performance_data)
+            full_prompt = f"You are an educational data analyst. Analyze student performance data and provide insights.\n\n{prompt}"
             
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are an educational data analyst. Analyze student performance data and provide insights."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=700,
-                temperature=0.4
+            response = self.model.generate_content(
+                full_prompt,
+                generation_config={
+                    'max_output_tokens': 700,
+                    'temperature': 0.4,
+                }
             )
             
-            content = response.choices[0].message.content.strip()
+            content = response.text.strip()
             return self._parse_analysis_response(content)
             
         except Exception as e:
@@ -222,15 +186,60 @@ class AIService:
     
     # Helper methods for building prompts
     def _build_system_prompt(self, context: Dict = None) -> str:
-        """Build system prompt for chat."""
-        base_prompt = "You are an AI assistant for an Student Tracking System. Help students with their academic queries, schedule questions, and study advice."
+        """Build system prompt for chat with database context."""
+        base_prompt = "You are an AI assistant for a Student Tracking System. Help students with their academic queries, schedule questions, and study advice. You have access to the student's real database information."
         
         if context:
-            if context.get('student_name'):
-                base_prompt += f" You are helping {context['student_name']}."
-            if context.get('current_courses'):
-                courses = ", ".join(context['current_courses'])
-                base_prompt += f" They are currently enrolled in: {courses}."
+            # Student basic info
+            student_info = context.get('student_info', {})
+            if student_info:
+                name = student_info.get('name', 'Student')
+                roll_number = student_info.get('roll_number', '')
+                course = student_info.get('course', '')
+                year = student_info.get('year', '')
+                section = student_info.get('section', '')
+                base_prompt += f"\n\nSTUDENT INFORMATION:\n- Name: {name}\n- Roll Number: {roll_number}\n- Course: {course}\n- Year: {year}\n- Section: {section}"
+            
+            # Enrolled subjects
+            enrolled_subjects = context.get('enrolled_subjects', [])
+            if enrolled_subjects:
+                subjects_list = "\n".join([f"  - {subj['name']} ({subj['code']}) - {subj['credits']} credits" for subj in enrolled_subjects])
+                base_prompt += f"\n\nENROLLED SUBJECTS:\n{subjects_list}"
+            
+            # Attendance summary
+            attendance_summary = context.get('attendance_summary', {})
+            if attendance_summary:
+                total = attendance_summary.get('total_classes', 0)
+                present = attendance_summary.get('present', 0)
+                absent = attendance_summary.get('absent', 0)
+                late = attendance_summary.get('late', 0)
+                percentage = attendance_summary.get('overall_percentage', 0)
+                base_prompt += f"\n\nOVERALL ATTENDANCE:\n- Total Classes: {total}\n- Present: {present}\n- Absent: {absent}\n- Late: {late}\n- Attendance Percentage: {percentage}%"
+            
+            # Subject-wise attendance
+            subject_attendance = context.get('subject_attendance', {})
+            if subject_attendance:
+                subject_att_list = "\n".join([f"  - {subject}: {stats['present']}/{stats['total']} classes ({stats['percentage']}%)" 
+                                             for subject, stats in subject_attendance.items()])
+                base_prompt += f"\n\nSUBJECT-WISE ATTENDANCE:\n{subject_att_list}"
+            
+            # Today's timetable
+            today_timetable = context.get('today_timetable', [])
+            if today_timetable:
+                timetable_list = "\n".join([f"  - {cls['subject']} with {cls['teacher']} in {cls['room']} at {cls['time']}" 
+                                           for cls in today_timetable])
+                base_prompt += f"\n\nTODAY'S SCHEDULE:\n{timetable_list}"
+            elif today_timetable == []:
+                base_prompt += "\n\nTODAY'S SCHEDULE: No classes scheduled for today."
+            
+            # Recent attendance
+            recent_attendance = context.get('recent_attendance', [])
+            if recent_attendance:
+                recent_list = "\n".join([f"  - {rec['date']}: {rec['subject']} - {rec['status'].upper()}" 
+                                        for rec in recent_attendance])
+                base_prompt += f"\n\nRECENT ATTENDANCE RECORDS:\n{recent_list}"
+        
+        base_prompt += "\n\nUse this information to answer the student's questions accurately. When asked about attendance, subjects, timetable, or schedule, provide specific details from the data above."
         
         return base_prompt
     
@@ -270,6 +279,32 @@ class AIService:
         
         Provide insights and recommendations for improvement.
         """
+    
+    # Gemini-specific methods
+    def _chat_with_gemini(self, message: str, context: Dict = None) -> str:
+        """Chat using Google Gemini API."""
+        try:
+            system_prompt = self._build_system_prompt(context)
+            full_prompt = f"{system_prompt}\n\nUser: {message}\nAssistant:"
+            
+            response = self.model.generate_content(
+                full_prompt,
+                generation_config={
+                    'max_output_tokens': 1000,
+                    'temperature': 0.7,
+                }
+            )
+            
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Gemini chat error: {e}")
+            # Fallback to offline AI
+            if self.offline_ai_available:
+                try:
+                    return self._chat_with_offline_ai(message, context)
+                except:
+                    pass
+            return self._generate_smart_response(message, context)
     
     # Mock response methods for development
     def _mock_chat_response(self, message: str, context: Dict = None) -> str:
@@ -381,141 +416,474 @@ class AIService:
         """Parse AI analysis response to structured format."""
         return self._mock_performance_analysis({})
     
-    # AI Provider specific methods
-    def _chat_with_openai(self, message: str, context: Dict = None) -> str:
-        """Chat using OpenAI API."""
-        system_prompt = self._build_system_prompt(context)
+    def _ensure_model_with_safety(self):
+        """Ensure model is initialized with safety settings."""
+        if not GEMINI_AVAILABLE:
+            return False
         
-        response = self.client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
-            max_tokens=500,
-            temperature=0.7
-        )
+        gemini_api_key = os.environ.get('GEMINI_API_KEY') or getattr(settings, 'GEMINI_API_KEY', None)
+        gemini_model_name = os.environ.get('GEMINI_MODEL') or getattr(settings, 'GEMINI_MODEL', 'gemini-2.5-flash')
         
-        return response.choices[0].message.content.strip()
-
-    def _chat_with_groq(self, message: str, context: Dict = None) -> str:
-        """Chat using Groq API (OpenAI-compatible). Fallback to HTTP if client fails."""
-        system_prompt = self._build_system_prompt(context)
-        model = (
-            os.environ.get('GROQ_MODEL') or
-            getattr(settings, 'GROQ_MODEL', None) or
-            'llama-3.1-8b-instant'
-        )
+        if not gemini_api_key or gemini_api_key == '':
+            return False
+        
         try:
-            # Try through OpenAI-compatible client first
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ],
-                max_tokens=500,
-                temperature=0.7
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"Groq client call failed, falling back to HTTP: {e}")
-            if not REQUESTS_AVAILABLE:
-                raise
-            import requests
-            base_url = os.environ.get('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
-            api_key = os.environ.get('GROQ_API_KEY') or getattr(settings, 'GROQ_API_KEY', None)
-            headers = {
-                'Authorization': f'Bearer {api_key}',
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                'model': model,
-                'messages': [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ],
-                'max_tokens': 500,
-                'temperature': 0.7
-            }
-            resp = requests.post(f"{base_url}/chat/completions", headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            return data['choices'][0]['message']['content'].strip()
-    
-    def _chat_with_huggingface(self, message: str, context: Dict = None) -> str:
-        """Chat using Hugging Face API."""
-        try:
-            headers = {"Authorization": f"Bearer {self.hf_token}"}
-            
-            # Build context-aware prompt
-            system_prompt = self._build_system_prompt(context)
-            full_prompt = f"{system_prompt}\n\nUser: {message}\nAssistant:"
-            
-            payload = {
-                "inputs": full_prompt,
-                "parameters": {
-                    "max_new_tokens": 200,
-                    "temperature": 0.7,
-                    "return_full_text": False
+            if HarmCategory and HarmBlockThreshold:
+                safety_settings = {
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
                 }
-            }
+                self.model = genai.GenerativeModel(gemini_model_name, safety_settings=safety_settings)
+            else:
+                self.model = genai.GenerativeModel(gemini_model_name)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to recreate model with safety settings: {e}")
+            return False
+    
+    def generate_timetable_with_gemini(self, timetable_context: Dict) -> Dict:
+        """Generate timetable using Gemini AI with full database context."""
+        try:
+            if self.mock_mode:
+                logger.warning("AI Service is in mock mode, returning mock timetable")
+                return {
+                    'success': False,
+                    'error': 'AI Service is in mock mode. Please configure Gemini API key.',
+                    'algorithm': 'mock'
+                }
             
-            # Try multiple models for better reliability
-            models_to_try = [
-                "microsoft/DialoGPT-large",
-                "microsoft/DialoGPT-medium", 
-                "facebook/blenderbot-400M-distill"
-            ]
+            if not hasattr(settings, 'GEMINI_API_KEY') or not settings.GEMINI_API_KEY:
+                logger.warning("GEMINI_API_KEY not configured")
+                return {
+                    'success': False,
+                    'error': 'Gemini API key not configured. Please set GEMINI_API_KEY in settings.',
+                    'algorithm': 'gemini_ai'
+                }
             
-            for model in models_to_try:
-                try:
-                    response = requests.post(
-                        f"https://api-inference.huggingface.co/models/{model}",
-                        headers=headers,
-                        json=payload,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        if isinstance(result, list) and len(result) > 0:
-                            generated_text = result[0].get('generated_text', '').strip()
-                            if generated_text:
-                                # Clean up the response
-                                return self._clean_hf_response(generated_text, message)
-                    
-                    elif response.status_code == 503:
-                        # Model is loading, try next one
+            # Ensure model has safety settings
+            if not self.model:
+                self._ensure_model_with_safety()
+            
+            if not self.model:
+                logger.warning("Gemini model not initialized")
+                return {
+                    'success': False,
+                    'error': 'Gemini model not initialized. Please check your API key and model name.',
+                    'algorithm': 'gemini_ai'
+                }
+            
+            prompt = self._build_timetable_generation_prompt(timetable_context)
+            logger.info(f"Calling Gemini API with prompt length: {len(prompt)}")
+            
+            # Also pass safety settings in generate_content call as backup
+            safety_settings_dict = None
+            if HarmCategory and HarmBlockThreshold:
+                safety_settings_dict = {
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            
+            response = self.model.generate_content(
+                prompt,
+                generation_config={
+                    'max_output_tokens': 4000,
+                    'temperature': 0.3,
+                },
+                safety_settings=safety_settings_dict if safety_settings_dict else None
+            )
+            
+            if not response:
+                logger.error("Gemini returned None response")
+                return {
+                    'success': False,
+                    'error': 'Empty response from Gemini API',
+                    'algorithm': 'gemini_ai'
+                }
+            
+            # Check if response was blocked
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    finish_reason = candidate.finish_reason
+                    # finish_reason 2 = SAFETY (blocked)
+                    # finish_reason 3 = RECITATION (blocked)
+                    # finish_reason 4 = OTHER (blocked)
+                    if finish_reason in [2, 3, 4]:
+                        logger.warning(f"Gemini response blocked (finish_reason: {finish_reason}). Using fallback timetable generation.")
+                        return self._generate_basic_timetable(timetable_context)
+            
+            # Try to get text content
+            try:
+                if not hasattr(response, 'text'):
+                    logger.error("Response object has no 'text' attribute")
+                    return {
+                        'success': False,
+                        'error': 'Invalid response format from Gemini API',
+                        'algorithm': 'gemini_ai'
+                    }
+                
+                content = response.text.strip()
+                if not content:
+                    logger.error("Gemini returned empty text content")
+                    return {
+                        'success': False,
+                        'error': 'Empty text content from Gemini API',
+                        'algorithm': 'gemini_ai'
+                    }
+                
+                logger.info(f"Received response from Gemini (length: {len(content)})")
+                return self._parse_timetable_response(content, timetable_context)
+            except ValueError as e:
+                # This happens when response.text is accessed but content was blocked
+                error_msg = str(e)
+                logger.warning(f"Error accessing response.text: {error_msg}. Using fallback timetable generation.")
+                if 'finish_reason' in error_msg or 'Part' in error_msg:
+                    return self._generate_basic_timetable(timetable_context)
+                return self._generate_basic_timetable(timetable_context)
+            
+        except Exception as e:
+            logger.error(f"Gemini timetable generation error: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Fallback to basic timetable generation if Gemini fails
+            logger.warning("Falling back to basic timetable generation due to Gemini error")
+            return self._generate_basic_timetable(timetable_context)
+    
+    def _generate_basic_timetable(self, context: Dict) -> Dict:
+        """Generate a basic timetable as fallback when Gemini fails."""
+        try:
+            config = context.get('config', {})
+            days = config.get('days_per_week', 5)
+            periods_per_day = config.get('periods_per_day', 8)
+            break_periods = config.get('break_periods', [])
+            subjects = context.get('subjects', [])
+            rooms = context.get('rooms', [])
+            time_slots = context.get('time_slots', [])
+            
+            if not subjects:
+                return {
+                    'success': False,
+                    'error': 'No subjects provided for timetable generation',
+                    'algorithm': 'fallback'
+                }
+            
+            grid = {}
+            subject_index = 0
+            room_index = 0
+            
+            # Calculate total periods needed
+            total_periods_needed = sum(subj.get('periods_per_week', 0) for subj in subjects)
+            periods_available = days * periods_per_day - len(break_periods) * days
+            
+            if total_periods_needed > periods_available:
+                logger.warning(f"More periods needed ({total_periods_needed}) than available ({periods_available})")
+            
+            for day in range(days):
+                grid[day] = {}
+                periods_scheduled = 0
+                
+                for period in range(periods_per_day):
+                    # Skip break periods
+                    if period in break_periods:
+                        grid[day][period] = {
+                            'subject_code': '-',
+                            'subject_name': 'Break',
+                            'teacher_name': '',
+                            'room': ''
+                        }
                         continue
+                    
+                    # Schedule subjects
+                    if subject_index < len(subjects):
+                        subj = subjects[subject_index]
+                        periods_for_subj = subj.get('periods_per_week', 0)
                         
-                except Exception as e:
-                    logger.warning(f"Error with HF model {model}: {e}")
+                        # Check if we've scheduled enough periods for this subject
+                        if periods_scheduled < periods_for_subj:
+                            room = rooms[room_index % len(rooms)] if rooms else {'room_number': '101'}
+                            grid[day][period] = {
+                                'subject_code': subj.get('subject_code', ''),
+                                'subject_name': subj.get('subject_name', ''),
+                                'teacher_name': subj.get('teacher_name', 'TBA'),
+                                'room': room.get('room_number', '101')
+                            }
+                            periods_scheduled += 1
+                            room_index += 1
+                            
+                            # Move to next subject if we've scheduled enough periods
+                            if periods_scheduled >= periods_for_subj:
+                                subject_index += 1
+                                periods_scheduled = 0
+                        else:
+                            grid[day][period] = None
+                    else:
+                        grid[day][period] = None
+            
+            return {
+                'success': True,
+                'algorithm': 'fallback',
+                'grid': grid,
+                'optimization_score': 70,  # Lower score for fallback
+                'conflicts_resolved': 0,
+                'constraint_violations': [],
+                'execution_time': 0.1,
+                'subjects': subjects
+            }
+        except Exception as e:
+            logger.error(f"Error in basic timetable generation: {e}")
+            return {
+                'success': False,
+                'error': f'Failed to generate basic timetable: {str(e)}',
+                'algorithm': 'fallback'
+            }
+    
+    def _build_timetable_generation_prompt(self, context: Dict) -> str:
+        """Build comprehensive prompt for timetable generation."""
+        prompt = """Create a class schedule timetable in JSON format.
+
+Return ONLY valid JSON:
+{
+  "success": true,
+  "grid": {
+    "0": {
+      "0": {"subject_code": "CS201", "subject_name": "Algorithms", "teacher_name": "Dr. Smith", "room": "101"},
+      "1": {"subject_code": "CS202", "subject_name": "Database", "teacher_name": "Dr. Jones", "room": "102"}
+    },
+    "1": {},
+    "2": {},
+    "3": {},
+    "4": {}
+  },
+  "optimization_score": 85,
+  "conflicts_resolved": 0,
+  "constraint_violations": []
+}
+
+Format:
+- grid keys: day numbers 0-4 (Monday-Friday)
+- grid[day] keys: period numbers starting from 0
+- Each entry needs: subject_code, subject_name, teacher_name, room
+
+"""
+        
+        # Add configuration
+        config = context.get('config', {})
+        prompt += f"\nTIMETABLE CONFIGURATION:\n"
+        prompt += f"- Days per week: {config.get('days_per_week', 5)}\n"
+        prompt += f"- Periods per day: {config.get('periods_per_day', 8)}\n"
+        prompt += f"- Break periods: {config.get('break_periods', [])}\n"
+        prompt += f"- Max teacher periods per day: {config.get('max_teacher_periods_per_day', 5)}\n"
+        prompt += f"- Max consecutive periods: {config.get('max_consecutive_periods', 2)}\n"
+        prompt += f"- Max subject periods per day: {config.get('max_subject_periods_per_day', 3)}\n"
+        
+        # Add course information
+        course_info = context.get('course_info', {})
+        prompt += f"\nCOURSE INFORMATION:\n"
+        prompt += f"- Course: {course_info.get('course', 'N/A')}\n"
+        prompt += f"- Year: {course_info.get('year', 'N/A')}\n"
+        prompt += f"- Section: {course_info.get('section', 'N/A')}\n"
+        
+        # Add subjects
+        subjects = context.get('subjects', [])
+        prompt += f"\nSUBJECTS TO SCHEDULE ({len(subjects)} total):\n"
+        for i, subj in enumerate(subjects, 1):
+            prompt += f"{i}. {subj.get('subject_code', 'N/A')} - {subj.get('subject_name', 'N/A')}\n"
+            prompt += f"   - Credits: {subj.get('credits', 0)}\n"
+            prompt += f"   - Periods per week: {subj.get('periods_per_week', 0)}\n"
+            prompt += f"   - Assigned Teacher: {subj.get('teacher_name', 'TBA')}\n"
+        
+        # Add teachers
+        teachers = context.get('teachers', [])
+        prompt += f"\nAVAILABLE TEACHERS ({len(teachers)} total):\n"
+        for teacher in teachers:
+            prompt += f"- {teacher.get('name', 'N/A')} (ID: {teacher.get('id', 'N/A')})\n"
+            if teacher.get('assigned_subjects'):
+                prompt += f"  Assigned subjects: {', '.join(teacher.get('assigned_subjects', []))}\n"
+        
+        # Add rooms
+        rooms = context.get('rooms', [])
+        prompt += f"\nAVAILABLE ROOMS ({len(rooms)} total):\n"
+        for room in rooms:
+            prompt += f"- {room.get('room_number', 'N/A')} (Capacity: {room.get('capacity', 'N/A')}, Type: {room.get('room_type', 'N/A')})\n"
+        
+        # Add time slots
+        time_slots = context.get('time_slots', [])
+        prompt += f"\nTIME SLOTS ({len(time_slots)} total):\n"
+        for slot in time_slots:
+            is_break = slot.get('is_break', False)
+            prompt += f"- Period {slot.get('period_number', 'N/A')}: {slot.get('start_time', 'N/A')} - {slot.get('end_time', 'N/A')}"
+            if is_break:
+                prompt += " (BREAK)"
+            prompt += "\n"
+        
+        # Add existing entries (to avoid conflicts)
+        existing_entries = context.get('existing_entries', [])
+        if existing_entries:
+            prompt += f"\nEXISTING TIMETABLE ENTRIES (avoid conflicts):\n"
+            for entry in existing_entries[:20]:  # Limit to first 20
+                prompt += f"- Day {entry.get('day', 'N/A')}, Period {entry.get('period', 'N/A')}: {entry.get('subject', 'N/A')} with {entry.get('teacher', 'N/A')} in {entry.get('room', 'N/A')}\n"
+        
+        # Add constraints (simplified to avoid filter triggers)
+        prompt += f"\nRules:\n"
+        prompt += f"- Schedule each subject for required periods per week\n"
+        prompt += f"- Max {config.get('max_teacher_periods_per_day', 5)} periods per teacher per day\n"
+        prompt += f"- Max {config.get('max_subject_periods_per_day', 3)} periods per subject per day\n"
+        prompt += f"- Max {config.get('max_consecutive_periods', 2)} consecutive periods per subject\n"
+        prompt += f"- Skip periods: {config.get('break_periods', [])}\n"
+        prompt += f"- One class per teacher per time\n"
+        prompt += f"- One class per room per time\n"
+        prompt += f"- Spread subjects across week\n"
+        
+        prompt += f"\nGenerate timetable. Return JSON only."
+        
+        return prompt
+    
+    def _parse_timetable_response(self, content: str, context: Dict) -> Dict:
+        """Parse Gemini's timetable response into structured format."""
+        try:
+            import json
+            import re
+            
+            # Extract JSON from response (handle markdown code blocks)
+            # Try to find JSON in code blocks first
+            code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+            if code_block_match:
+                json_str = code_block_match.group(1)
+            else:
+                # Try to find JSON object directly
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    json_str = content.strip()
+            
+            # Parse JSON
+            data = json.loads(json_str)
+            
+            if not data.get('success', False):
+                error_msg = data.get('error', 'Gemini returned success=false')
+                logger.error(f"Gemini returned unsuccessful response: {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'algorithm': 'gemini_ai'
+                }
+            
+            # Convert grid format to match expected structure
+            grid = data.get('grid', {})
+            if not grid:
+                logger.error("Gemini returned empty grid")
+                return {
+                    'success': False,
+                    'error': 'Empty timetable grid received from Gemini',
+                    'algorithm': 'gemini_ai'
+                }
+            
+            converted_grid = {}
+            
+            for day_str, periods in grid.items():
+                try:
+                    day = int(day_str)
+                    converted_grid[day] = {}
+                    if not isinstance(periods, dict):
+                        logger.warning(f"Periods for day {day} is not a dict: {type(periods)}")
+                        continue
+                    for period_str, entry in periods.items():
+                        try:
+                            period = int(period_str)
+                            # Handle None or empty entries
+                            if entry is None or not isinstance(entry, dict):
+                                converted_grid[day][period] = None
+                            else:
+                                converted_grid[day][period] = {
+                                    'subject_code': entry.get('subject_code', ''),
+                                    'subject_name': entry.get('subject_name', ''),
+                                    'teacher_name': entry.get('teacher_name', ''),
+                                    'room': entry.get('room', '')
+                                }
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Error parsing period {period_str}: {e}")
+                            continue
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing day {day_str}: {e}")
                     continue
             
-            # If all models fail, return intelligent fallback
-            return self._generate_smart_response(message, context)
+            if not converted_grid:
+                logger.error("Failed to convert any grid entries")
+                return {
+                    'success': False,
+                    'error': 'Failed to parse timetable grid from Gemini response',
+                    'algorithm': 'gemini_ai'
+                }
             
+            return {
+                'success': True,
+                'algorithm': 'gemini_ai',
+                'grid': converted_grid,
+                'optimization_score': data.get('optimization_score', 80),
+                'conflicts_resolved': data.get('conflicts_resolved', 0),
+                'constraint_violations': data.get('constraint_violations', []),
+                'execution_time': 0.5,  # Gemini is fast
+                'subjects': context.get('subjects', [])
+            }
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error parsing timetable response: {str(e)}")
+            logger.error(f"Response content (first 1000 chars): {content[:1000]}")
+            return {
+                'success': False,
+                'error': f'Invalid JSON response from Gemini: {str(e)}',
+                'algorithm': 'gemini_ai'
+            }
         except Exception as e:
-            logger.error(f"Hugging Face chat error: {e}")
-            return self._generate_smart_response(message, context)
+            logger.error(f"Error parsing timetable response: {str(e)}")
+            logger.error(f"Response content (first 1000 chars): {content[:1000]}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'success': False,
+                'error': f'Error parsing Gemini response: {str(e)}',
+                'algorithm': 'gemini_ai'
+            }
     
-    def _clean_hf_response(self, generated_text: str, original_message: str) -> str:
-        """Clean and format Hugging Face response."""
-        # Remove any repetition of the original message
-        cleaned = generated_text.replace(original_message, "").strip()
+    def _mock_timetable_generation(self, context: Dict) -> Dict:
+        """Generate mock timetable for fallback."""
+        days = context.get('config', {}).get('days_per_week', 5)
+        periods = context.get('config', {}).get('periods_per_day', 8)
+        subjects = context.get('subjects', [])
         
-        # Remove common prefixes/suffixes
-        prefixes_to_remove = ["Assistant:", "Bot:", "AI:", "Response:"]
-        for prefix in prefixes_to_remove:
-            if cleaned.startswith(prefix):
-                cleaned = cleaned[len(prefix):].strip()
+        grid = {}
+        subject_index = 0
         
-        # Ensure response is helpful and contextual
-        if len(cleaned) < 10 or not cleaned:
-            return self._generate_smart_response(original_message)
+        for day in range(days):
+            grid[day] = {}
+            for period in range(periods):
+                if subject_index < len(subjects):
+                    subj = subjects[subject_index]
+                    grid[day][period] = {
+                        'subject_code': subj.get('subject_code', ''),
+                        'subject_name': subj.get('subject_name', ''),
+                        'teacher_name': subj.get('teacher_name', 'TBA'),
+                        'room': '101'
+                    }
+                    subject_index += 1
+                else:
+                    grid[day][period] = None
         
-        return cleaned
+        return {
+            'success': True,
+            'algorithm': 'mock',
+            'grid': grid,
+            'optimization_score': 60,
+            'conflicts_resolved': 0,
+            'constraint_violations': [],
+            'execution_time': 0.1,
+            'subjects': subjects
+        }
     
     def _chat_with_offline_ai(self, message: str, context: Dict = None) -> str:
         """Chat using offline AI."""

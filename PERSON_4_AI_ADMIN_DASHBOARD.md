@@ -69,6 +69,7 @@ class AlgorithmicTimetableSuggestion(models.Model):
     ]
     
     ALGORITHM_CHOICES = [
+        ('gemini_ai', 'Gemini AI'),  # NEW: AI-powered timetable generation
         ('constraint_satisfaction', 'Constraint Satisfaction'),
         ('genetic_algorithm', 'Genetic Algorithm'),
         ('greedy_algorithm', 'Greedy Algorithm'),
@@ -86,6 +87,10 @@ class AlgorithmicTimetableSuggestion(models.Model):
   - `implemented`: Actually use ho raha hai
   
 - **ALGORITHM_CHOICES**: Kaunsa algorithm use hua
+  - **Gemini AI** (NEW): Google's Gemini AI se intelligent timetable generation
+    - Full database context use karta hai (subjects, teachers, rooms, constraints)
+    - Natural language understanding se optimal schedule banata hai
+    - Automatic conflict resolution aur optimization
   - **Constraint Satisfaction**: Rules satisfy karna (no conflicts)
   - **Genetic Algorithm**: Evolution-based optimization
   - **Greedy Algorithm**: Best choice at each step
@@ -415,7 +420,144 @@ class SmartNotification(models.Model):
 
 ---
 
-### 5. Algorithmic Timetable Generation (`utils/algorithmic_timetable.py`)
+### 5. Applying AI-Generated Timetable Suggestions (`accounts/admin_api_views.py`) - UPDATED!
+
+**Latest Update**: Apply suggestion functionality ab properly kaam karta hai with correct grid parsing!
+
+```python
+def apply_algorithmic_suggestion(request, suggestion_id):
+    """Apply an algorithmic timetable suggestion to actual TimetableEntry records."""
+    suggestion = get_object_or_404(AlgorithmicTimetableSuggestion, id=suggestion_id)
+    data = suggestion.suggestion_data or {}
+    grid = data.get('grid', {})  # grid[day][period] structure
+    
+    # Grid structure: grid[day][period] = {subject_code, subject_name, teacher_name, room}
+    for day_str, periods_dict in grid.items():
+        day = int(day_str)  # Convert "0" to 0 (Monday)
+        
+        # Handle both dict and list formats
+        if isinstance(periods_dict, dict):
+            periods_items = periods_dict.items()
+        elif isinstance(periods_dict, list):
+            periods_items = enumerate(periods_dict)
+        
+        for period_str, cell in periods_items:
+            # Skip None or empty cells
+            if not cell or not isinstance(cell, dict):
+                continue
+            
+            period = int(period_str)  # Period number from key
+            code = cell.get('subject_code', '').strip()
+            
+            # Find subject, teacher, room, time slot
+            subject = subjects.get(code)
+            teacher = teachers_by_name.get(cell.get('teacher_name'))
+            slot = time_slots_by_period.get(period)
+            room = find_room_by_number(cell.get('room'))
+            
+            # Create TimetableEntry
+            TimetableEntry.objects.create(
+                subject=subject,
+                teacher=teacher,
+                course=course,
+                year=year,
+                section=section,
+                day_of_week=day,
+                time_slot=slot,
+                room=room,
+                ...
+            )
+```
+
+**Hinglish Explanation:**
+
+**Grid Structure Parsing (FIXED):**
+- **Before**: Code `rows` ko list samajh raha tha
+- **After**: Ab correctly `grid[day][period]` dictionary structure handle karta hai
+- **Period Number**: Ab key se extract hota hai, cell se nahi
+
+**Key Fixes:**
+1. ✅ **Correct Iteration**: `for period_str, cell in periods_dict.items()`
+2. ✅ **Period Extraction**: `period = int(period_str)` from dictionary key
+3. ✅ **Type Checking**: Proper validation for None/empty cells
+4. ✅ **Room Lookup**: Improved room finding by `room_number`
+
+**Process:**
+1. **Get Suggestion**: Database se suggestion fetch karo
+2. **Parse Grid**: `grid[day][period]` structure ko correctly parse karo
+3. **Remove Old Entries**: Existing entries ko deactivate karo
+4. **Create New Entries**: Grid se har cell ke liye TimetableEntry banao
+5. **Update Status**: Suggestion ko `implemented` mark karo
+
+**Error Handling:**
+- Missing subjects: Skip karo
+- Missing teachers: Try TeacherSubject mapping
+- Missing rooms: Use fallback room
+- Break periods: Automatically skip
+
+---
+
+### 6. Gemini AI Timetable Generation (`utils/ai_service.py`) - NEW!
+
+**Latest Update**: System ab Google Gemini AI use karta hai for intelligent timetable generation!
+
+```python
+def generate_timetable_with_gemini(self, timetable_context: Dict) -> Dict:
+    """Generate timetable using Gemini AI with full database context."""
+    # 1. Build comprehensive prompt with all database data
+    prompt = self._build_timetable_generation_prompt(timetable_context)
+    
+    # 2. Call Gemini API with safety settings
+    response = self.model.generate_content(
+        prompt,
+        generation_config={
+            'max_output_tokens': 4000,
+            'temperature': 0.3,
+        }
+    )
+    
+    # 3. Parse JSON response
+    return self._parse_timetable_response(content, timetable_context)
+```
+
+**Hinglish Explanation:**
+
+**Gemini AI Integration:**
+- **Full Database Context**: Gemini ko sab kuch pata hota hai
+  - Subjects, teachers, rooms, time slots
+  - Existing timetable entries (conflicts avoid karne ke liye)
+  - All constraints aur requirements
+- **Intelligent Generation**: AI samajhta hai ki optimal schedule kya hona chahiye
+- **Automatic Optimization**: Constraints automatically handle karta hai
+- **Fallback System**: Agar Gemini fail ho, to basic timetable generate karta hai
+
+**Grid Structure:**
+```python
+grid = {
+    "0": {  # Monday
+        "0": {"subject_code": "CS101", "subject_name": "Programming", 
+              "teacher_name": "Dr. Smith", "room": "101"},
+        "1": {"subject_code": "MA101", ...},
+        ...
+    },
+    "1": { ... },  # Tuesday
+    ...
+}
+```
+
+**Safety Settings:**
+- Educational content ke liye safety filters disabled
+- Proper error handling agar response blocked ho
+
+**Key Features:**
+1. ✅ **Database-Aware**: Sab data automatically fetch hota hai
+2. ✅ **Constraint Handling**: Max periods, breaks, conflicts sab handle
+3. ✅ **Error Recovery**: Fallback timetable agar Gemini fail ho
+4. ✅ **JSON Parsing**: Robust parsing with error handling
+
+---
+
+### 6. Algorithmic Timetable Generation (`utils/algorithmic_timetable.py`)
 
 ```python
 def generate_timetable_constraint_satisfaction(course, year, section, semester, config):
@@ -1893,7 +2035,217 @@ with ai_request_duration.time():
 
 ---
 
+---
+
+## 🚀 Deployment Guide (Render.com)
+
+### Prerequisites
+1. **Render Account**: https://render.com pe account banao
+2. **GitHub Repository**: Code GitHub pe push karo
+3. **Gmail App Password**: Email ke liye (16 characters, no spaces)
+
+### Step 1: Environment Variables Setup
+
+Render Dashboard mein yeh variables set karo:
+
+```env
+# Basic Settings
+DEBUG=False
+SECRET_KEY=<auto-generated-by-render>
+ALLOWED_HOSTS=your-app.onrender.com,*.onrender.com
+
+# Database (Auto-configured by Render)
+DATABASE_URL=<auto-provided-by-render>
+
+# Email Configuration (CRITICAL - No spaces in password!)
+EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_USE_TLS=True
+EMAIL_HOST_USER=your-email@gmail.com
+EMAIL_HOST_PASSWORD=your16charapppass  # ⚠️ NO SPACES!
+DEFAULT_FROM_EMAIL=your-email@gmail.com
+
+# Gemini AI Configuration (NEW!)
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_MODEL=gemini-2.5-flash
+
+# Security
+CSRF_TRUSTED_ORIGINS=https://your-app.onrender.com
+```
+
+### Step 2: Build Configuration
+
+**build.sh** file:
+```bash
+#!/usr/bin/env bash
+set -o errexit
+
+pip install --upgrade pip
+pip install -r requirements.txt
+python manage.py collectstatic --noinput
+python manage.py migrate
+```
+
+**render.yaml** (Optional):
+```yaml
+services:
+  - type: web
+    name: enhanced-timetable-system
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn enhanced_timetable_system.wsgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DEBUG
+        value: False
+```
+
+### Step 3: Database Setup
+
+1. **PostgreSQL Database**: Render automatically create karta hai
+2. **Migrations**: Build command automatically run hoti hain
+3. **Superuser**: Production admin create karo:
+   ```bash
+   python manage.py create_production_admin
+   ```
+
+### Step 4: Static Files
+
+**settings.py** mein:
+```python
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
+```
+
+### Step 5: Gemini AI Setup
+
+1. **Get API Key**: https://makersuite.google.com/app/apikey
+2. **Add to Render**: Environment variables mein `GEMINI_API_KEY` add karo
+3. **Model**: Default `gemini-2.5-flash` (fast aur efficient)
+
+### Step 6: Deployment Checklist
+
+- [ ] All environment variables set kiye
+- [ ] `EMAIL_HOST_PASSWORD` mein **NO SPACES** (16 chars exactly)
+- [ ] `DEBUG=False` production mein
+- [ ] `ALLOWED_HOSTS` correct domain ke saath
+- [ ] `CSRF_TRUSTED_ORIGINS` set kiye
+- [ ] `GEMINI_API_KEY` add kiya
+- [ ] Database migrations successful
+- [ ] Static files collected
+- [ ] Superuser account created
+- [ ] Email sending tested
+- [ ] Gemini AI tested
+
+### Step 7: Post-Deployment Testing
+
+1. **Health Check**: 
+   ```bash
+   curl https://your-app.onrender.com/
+   ```
+
+2. **Admin Login**: 
+   - Go to `/admin/`
+   - Login with superuser credentials
+
+3. **Timetable Generation**:
+   - Go to `/admin/timetable/`
+   - Select course, year, section
+   - Click "Generate Optimized Timetable"
+   - Verify Gemini AI generates timetable
+
+4. **Apply Suggestion**:
+   - View generated suggestion
+   - Click "Apply Suggestion"
+   - Verify timetable entries created
+
+### Common Deployment Issues
+
+**Issue 1: Email Not Sending**
+- ✅ Check `EMAIL_HOST_PASSWORD` has NO SPACES
+- ✅ Verify Gmail App Password is correct (16 chars)
+- ✅ Check `EMAIL_USE_TLS=True`
+
+**Issue 2: Gemini AI Not Working**
+- ✅ Verify `GEMINI_API_KEY` is set correctly
+- ✅ Check API key is valid at https://makersuite.google.com
+- ✅ Model name should be `gemini-2.5-flash`
+
+**Issue 3: Static Files Not Loading**
+- ✅ Run `python manage.py collectstatic` in build command
+- ✅ Check `STATIC_ROOT` path is correct
+- ✅ Verify `STATIC_URL='/static/'`
+
+**Issue 4: Database Connection Failed**
+- ✅ Check `DATABASE_URL` is auto-provided by Render
+- ✅ Verify PostgreSQL database is created
+- ✅ Check migrations ran successfully
+
+### Production Best Practices
+
+1. **Security**:
+   - ✅ `DEBUG=False` always
+   - ✅ Strong `SECRET_KEY`
+   - ✅ `ALLOWED_HOSTS` properly configured
+   - ✅ `CSRF_TRUSTED_ORIGINS` set
+
+2. **Performance**:
+   - ✅ Use PostgreSQL (not SQLite)
+   - ✅ Enable caching (Redis recommended)
+   - ✅ Static files on CDN
+   - ✅ Database connection pooling
+
+3. **Monitoring**:
+   - ✅ Log errors properly
+   - ✅ Monitor API usage (Gemini)
+   - ✅ Track email sending
+   - ✅ Database query optimization
+
+4. **Backup**:
+   - ✅ Regular database backups
+   - ✅ Environment variables documented
+   - ✅ Code version control (Git)
+
+---
+
+## 📝 Recent Updates (Latest Changes)
+
+### ✅ Gemini AI Integration (Latest)
+- **Added**: Google Gemini AI for intelligent timetable generation
+- **Features**: 
+  - Full database context awareness
+  - Automatic constraint handling
+  - Fallback mechanism if AI fails
+  - Safety settings for educational content
+- **Files Updated**:
+  - `utils/ai_service.py`: Gemini integration
+  - `accounts/admin_views.py`: Timetable generation with Gemini
+  - `ai_features/models.py`: Added `gemini_ai` to ALGORITHM_CHOICES
+
+### ✅ Apply Suggestion Fix
+- **Fixed**: `'str' object has no attribute 'get'` error
+- **Solution**: Correct grid structure parsing (`grid[day][period]`)
+- **Files Updated**:
+  - `accounts/admin_api_views.py`: Fixed iteration logic
+
+### ✅ Form Data Handling
+- **Fixed**: Form submission now uses selected course/year/section
+- **Before**: Looped through all existing entries
+- **After**: Uses form data directly
+
+### ✅ Error Handling Improvements
+- Better validation messages
+- Fallback timetable generation
+- Proper error responses
+
+---
+
 **Good Luck! 🎉**
 
 **Pro Tip**: Algorithm ko step-by-step example se explain karo - whiteboard pe draw karke dikhao ki backtracking kaise kaam karta hai. Visual explanation confidence aur understanding dono badhati hai!
+
+**New Pro Tip**: Gemini AI integration explain karte waqt database context ka importance batana - kaise AI ko sab data milta hai aur wo optimal solution generate karta hai!
 

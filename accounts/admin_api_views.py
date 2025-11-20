@@ -540,46 +540,91 @@ def apply_algorithmic_suggestion(request, suggestion_id):
         skipped_no_teacher = 0
         skipped_no_room = 0
         skipped_break = 0
+        skipped_no_subject = 0
+        
         with transaction.atomic():
-            for day_str, rows in grid.items():
+            # Grid structure: grid[day][period] = {subject_code, subject_name, teacher_name, room}
+            for day_str, periods_dict in grid.items():
                 try:
                     day = int(day_str)
                 except ValueError:
                     # Accept Monday..Friday strings as fallback
                     day_names = {'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3, 'Friday': 4, 'Saturday': 5}
                     day = day_names.get(day_str, 0)
-                for cell in rows:
-                    code = cell.get('subject_code')
-                    if not code or code == '-':
+                
+                # Handle both dict and list formats for periods
+                if isinstance(periods_dict, dict):
+                    periods_items = periods_dict.items()
+                elif isinstance(periods_dict, list):
+                    # Convert list format to dict format
+                    periods_items = enumerate(periods_dict)
+                else:
+                    continue
+                
+                for period_str, cell in periods_items:
+                    # Skip None or empty cells
+                    if not cell or not isinstance(cell, dict):
                         continue
+                    
+                    # Get period number
+                    try:
+                        period = int(period_str)
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # Get subject code
+                    code = cell.get('subject_code', '').strip()
+                    if not code or code == '-' or code == 'BREAK':
+                        skipped_break += 1
+                        continue
+                    
+                    # Find subject
                     subject = subjects.get(code)
                     if not subject:
+                        skipped_no_subject += 1
                         continue
-                    teacher_name = cell.get('teacher_name') or ''
-                    teacher = teachers_by_name.get(teacher_name)
-                    # Use any teacher if not matched
+                    
+                    # Get teacher
+                    teacher_name = cell.get('teacher_name', '').strip()
+                    teacher = teachers_by_name.get(teacher_name) if teacher_name else None
+                    
+                    # Try to find teacher via TeacherSubject if not found by name
                     if not teacher:
-                        ts_rel = TeacherSubject.objects.filter(subject=subject, is_active=True).select_related('teacher').first()
+                        ts_rel = TeacherSubject.objects.filter(
+                            subject=subject, is_active=True
+                        ).select_related('teacher').first()
                         teacher = ts_rel.teacher if ts_rel else None
-                    period = cell.get('period_number')
+                    
+                    if not teacher:
+                        skipped_no_teacher += 1
+                        continue
+                    
+                    # Get time slot
                     slot = time_slots_by_period.get(period)
                     if not slot:
                         skipped_break += 1
                         continue
+                    
                     if getattr(slot, 'is_break', False):
                         skipped_break += 1
                         continue
-                    room = pick_room()
+                    
+                    # Get room
+                    room_number = cell.get('room', '').strip()
+                    room = None
+                    if room_number:
+                        # Try to find room by room_number
+                        room = next((r for r in rooms if r.room_number == room_number), None)
+                    
+                    # Fallback to any available room
+                    if not room:
+                        room = pick_room()
+                    
                     if not room:
                         skipped_no_room += 1
                         continue
-                    if not teacher:
-                        # Try to resolve via TeacherSubject mapping
-                        ts_rel = TeacherSubject.objects.filter(subject=subject, is_active=True).select_related('teacher').first()
-                        teacher = ts_rel.teacher if ts_rel else None
-                    if not teacher:
-                        skipped_no_teacher += 1
-                        continue
+                    
+                    # Create timetable entry
                     TimetableEntry.objects.create(
                         subject=subject,
                         teacher=teacher,
@@ -608,6 +653,7 @@ def apply_algorithmic_suggestion(request, suggestion_id):
             'skipped': {
                 'no_teacher': skipped_no_teacher,
                 'no_room': skipped_no_room,
+                'no_subject': skipped_no_subject,
                 'break_slots': skipped_break
             },
             'algorithm': suggestion.algorithm_type,
